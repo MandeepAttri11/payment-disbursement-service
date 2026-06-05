@@ -160,4 +160,70 @@ public class DisbursementService {
         d.transitionTo(DisbursementStatus.FAILED);
         disbursements.update(d);
     }
+
+    @Transactional
+    public void pollUncertain(UUID disbursementId) {
+        Disbursement d = disbursements.findById(disbursementId).orElseThrow();
+        if (d.status() != DisbursementStatus.UNCERTAIN) return;
+        DisbursementAttempt attempt = attempts.findById(d.currentAttemptId()).orElseThrow();
+        if (attempt.status() != AttemptStatus.UNCERTAIN) return;
+
+        ChannelResponse resp = channels.get(attempt.channel()).status(attempt.id());
+        attempt.incrementPollCount();
+        attempts.update(attempt);
+
+        if (resp.status() == AttemptStatus.SUCCESS) {
+            attempt.complete(AttemptStatus.SUCCESS, null, resp.rawResponse());
+            attempts.update(attempt);
+            d.transitionTo(DisbursementStatus.SUCCESS);
+            d.setNextActionAt(null);
+            disbursements.update(d);
+            return;
+        }
+        if (resp.status() == AttemptStatus.FAILED_PERMANENT) {
+            attempt.complete(AttemptStatus.FAILED_PERMANENT, resp.failureReason(), resp.rawResponse());
+            attempts.update(attempt);
+            d.setFailureReason(resp.failureReason());
+            d.transitionTo(DisbursementStatus.FAILED);
+            disbursements.update(d);
+            return;
+        }
+        if (resp.status() == AttemptStatus.FAILED_TRANSIENT) {
+            attempt.complete(AttemptStatus.FAILED_TRANSIENT, resp.failureReason(), resp.rawResponse());
+            attempts.update(attempt);
+            scheduleRetryOrFallback(d, attempt);
+            disbursements.update(d);
+            return;
+        }
+        if (attempt.pollCount() >= 5) {
+            // Surrender to ops; reconciliation will resolve. Stay UNCERTAIN — never auto-flip
+            // to FAILED here because money may have moved.
+            d.setFailureReason(FailureReason.CHANNEL_TIMEOUT_AFTER_SEND);
+            d.setNextActionAt(null);
+            disbursements.update(d);
+            return;
+        }
+        d.setNextActionAt(Instant.now().plus(retryPolicy.uncertainPollBackoff(attempt.pollCount())));
+        disbursements.update(d);
+    }
+
+    @Transactional
+    public Disbursement manualRetry(UUID disbursementId) {
+        Disbursement d = disbursements.findById(disbursementId).orElseThrow();
+        if (d.status() != DisbursementStatus.FAILED) {
+            throw new IllegalStateException("Disbursement not in FAILED state, current: " + d.status());
+        }
+        d.transitionTo(DisbursementStatus.PENDING_RETRY);
+        d.setFailureReason(null);
+        d.setCurrentAttemptId(null);
+        d.setNextActionAt(Instant.now());
+        disbursements.update(d);
+        return d;
+    }
+
+    public java.util.List<DisbursementAttempt> attemptsFor(UUID id) {
+        return attempts.findByDisbursementId(id);
+    }
+
+    public java.util.Optional<Disbursement> findById(UUID id) { return disbursements.findById(id); }
 }
