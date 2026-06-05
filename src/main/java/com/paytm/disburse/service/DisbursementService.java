@@ -5,6 +5,7 @@ import com.paytm.disburse.channel.ChannelRequest;
 import com.paytm.disburse.channel.ChannelResponse;
 import com.paytm.disburse.channel.ChannelRouter;
 import com.paytm.disburse.domain.*;
+import com.paytm.disburse.observability.DisbursementMetrics;
 import com.paytm.disburse.repository.AttemptRepository;
 import com.paytm.disburse.repository.DisbursementRepository;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
@@ -12,6 +13,7 @@ import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
@@ -26,6 +28,7 @@ public class DisbursementService {
     private final ChannelClientRegistry channels;
     private final RetryPolicy retryPolicy;
     private final CircuitBreakerRegistry registry;
+    private final DisbursementMetrics metrics;
 
     public DisbursementService(DisbursementRepository disbursements,
                                AttemptRepository attempts,
@@ -33,7 +36,8 @@ public class DisbursementService {
                                ChannelRouter router,
                                ChannelClientRegistry channels,
                                RetryPolicy retryPolicy,
-                               CircuitBreakerRegistry registry) {
+                               CircuitBreakerRegistry registry,
+                               DisbursementMetrics metrics) {
         this.disbursements = disbursements;
         this.attempts = attempts;
         this.idempotency = idempotency;
@@ -41,6 +45,7 @@ public class DisbursementService {
         this.channels = channels;
         this.retryPolicy = retryPolicy;
         this.registry = registry;
+        this.metrics = metrics;
     }
 
     @Transactional
@@ -67,6 +72,7 @@ public class DisbursementService {
         }
         try {
             disbursements.insert(d);
+            metrics.created();
         } catch (DuplicateKeyException dupe) {
             return disbursements.findByLoanId(cmd.loanId()).orElseThrow();
         }
@@ -95,7 +101,7 @@ public class DisbursementService {
         // resolve uncertainty without double-disbursing.
         attempts.insert(attempt);
         d.setCurrentAttemptId(attempt.id());
-        d.transitionTo(DisbursementStatus.IN_FLIGHT);
+        transition(d, DisbursementStatus.IN_FLIGHT);
         disbursements.update(d);
 
         ChannelRequest req = new ChannelRequest(
@@ -115,22 +121,27 @@ public class DisbursementService {
         attempt.complete(resp.status(), resp.failureReason(), resp.rawResponse());
         attempts.update(attempt);
 
+        metrics.attempt(attempt.channel(), resp.status(), Duration.between(attempt.createdAt(), Instant.now()));
+
         switch (resp.status()) {
             case SUCCESS -> {
-                d.transitionTo(DisbursementStatus.SUCCESS);
+                transition(d, DisbursementStatus.SUCCESS);
                 d.setNextActionAt(null);
             }
             case FAILED_PERMANENT -> {
                 d.setFailureReason(resp.failureReason());
-                d.transitionTo(DisbursementStatus.FAILED);
+                transition(d, DisbursementStatus.FAILED);
             }
             case FAILED_TRANSIENT -> scheduleRetryOrFallback(d, attempt);
             case UNCERTAIN -> {
                 // Do NOT fall back to a different channel — money may have moved.
-                d.transitionTo(DisbursementStatus.UNCERTAIN);
+                transition(d, DisbursementStatus.UNCERTAIN);
                 d.setNextActionAt(Instant.now().plus(retryPolicy.uncertainPollBackoff(0)));
             }
             case IN_FLIGHT -> throw new IllegalStateException("channel returned IN_FLIGHT");
+        }
+        if (d.status().isTerminal()) {
+            metrics.completed(d.status());
         }
         disbursements.update(d);
     }
@@ -138,17 +149,17 @@ public class DisbursementService {
     private void scheduleRetryOrFallback(Disbursement d, DisbursementAttempt last) {
         if (!retryPolicy.exhausted(last.attemptNumber())) {
             d.setNextActionAt(Instant.now().plus(retryPolicy.backoffFor(last.attemptNumber() + 1)));
-            d.transitionTo(DisbursementStatus.PENDING_RETRY);
+            transition(d, DisbursementStatus.PENDING_RETRY);
             return;
         }
         List<Channel> route = router.routeFor(d.amountPaise());
         int idx = route.indexOf(last.channel());
         if (idx >= 0 && idx + 1 < route.size()) {
             d.setNextActionAt(Instant.now());
-            d.transitionTo(DisbursementStatus.PENDING_RETRY);
+            transition(d, DisbursementStatus.PENDING_RETRY);
         } else {
             d.setFailureReason(last.failureReason());
-            d.transitionTo(DisbursementStatus.FAILED);
+            transition(d, DisbursementStatus.FAILED);
         }
     }
 
@@ -167,7 +178,7 @@ public class DisbursementService {
 
     private void markFailed(Disbursement d, FailureReason reason) {
         d.setFailureReason(reason);
-        d.transitionTo(DisbursementStatus.FAILED);
+        transition(d, DisbursementStatus.FAILED);
         disbursements.update(d);
     }
 
@@ -185,7 +196,7 @@ public class DisbursementService {
         if (resp.status() == AttemptStatus.SUCCESS) {
             attempt.complete(AttemptStatus.SUCCESS, null, resp.rawResponse());
             attempts.update(attempt);
-            d.transitionTo(DisbursementStatus.SUCCESS);
+            transition(d, DisbursementStatus.SUCCESS);
             d.setNextActionAt(null);
             disbursements.update(d);
             return;
@@ -194,7 +205,7 @@ public class DisbursementService {
             attempt.complete(AttemptStatus.FAILED_PERMANENT, resp.failureReason(), resp.rawResponse());
             attempts.update(attempt);
             d.setFailureReason(resp.failureReason());
-            d.transitionTo(DisbursementStatus.FAILED);
+            transition(d, DisbursementStatus.FAILED);
             disbursements.update(d);
             return;
         }
@@ -223,12 +234,18 @@ public class DisbursementService {
         if (d.status() != DisbursementStatus.FAILED) {
             throw new IllegalStateException("Disbursement not in FAILED state, current: " + d.status());
         }
-        d.transitionTo(DisbursementStatus.PENDING_RETRY);
+        transition(d, DisbursementStatus.PENDING_RETRY);
         d.setFailureReason(null);
         d.setCurrentAttemptId(null);
         d.setNextActionAt(Instant.now());
         disbursements.update(d);
         return d;
+    }
+
+    private void transition(Disbursement d, DisbursementStatus next) {
+        DisbursementStatus prev = d.status();
+        d.transitionTo(next);
+        metrics.transition(prev, next);
     }
 
     public java.util.List<DisbursementAttempt> attemptsFor(UUID id) {

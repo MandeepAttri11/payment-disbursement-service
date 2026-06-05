@@ -2,6 +2,7 @@ package com.paytm.disburse.service;
 
 import com.paytm.disburse.domain.AttemptStatus;
 import com.paytm.disburse.domain.DisbursementAttempt;
+import com.paytm.disburse.observability.DisbursementMetrics;
 import com.paytm.disburse.repository.RowMappers;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
@@ -22,8 +23,12 @@ public class ReconciliationService {
     public record Report(int internalCount, int bankCount, int matched, List<Break> breaks) {}
 
     private final JdbcTemplate jdbc;
+    private final DisbursementMetrics metrics;
 
-    public ReconciliationService(JdbcTemplate jdbc) { this.jdbc = jdbc; }
+    public ReconciliationService(JdbcTemplate jdbc, DisbursementMetrics metrics) {
+        this.jdbc = jdbc;
+        this.metrics = metrics;
+    }
 
     public Report reconcile(InputStream csv) throws Exception {
         List<BankRow> bank = parseCsv(csv);
@@ -68,6 +73,7 @@ public class ReconciliationService {
                     "We show SUCCESS but bank statement has no row", e.getKey()));
             }
         }
+        breaks.forEach(b -> metrics.reconcileBreak(b.type()));
         return new Report(internalByRef.size(), bank.size(), matched, breaks);
     }
 
