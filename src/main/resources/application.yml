@@ -1,0 +1,60 @@
+spring:
+  application:
+    name: payment-disbursement-service
+  datasource:
+    url: jdbc:h2:mem:disburse;MODE=PostgreSQL;DB_CLOSE_DELAY=-1
+    username: sa
+    password: ""
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+  jackson:
+    default-property-inclusion: non_null
+
+server:
+  port: 8080
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      show-details: always
+
+disburse:
+  worker:
+    enabled: true
+    batch-size: 50
+    poll-interval-ms: 2000
+  retry:
+    max-attempts-per-channel: 3
+    backoff-ms: [2000, 8000, 30000]
+    jitter-percent: 25
+  uncertain:
+    max-polls: 5
+    poll-backoff-ms: [5000, 15000, 30000, 60000, 120000]
+  channels:
+    upi:
+      success-rate: 0.91
+      mean-latency-ms: 200
+      timeout-rate: 0.02
+      max-amount-paise: 10000000
+    imps:
+      success-rate: 0.94
+      mean-latency-ms: 400
+      timeout-rate: 0.03
+      max-amount-paise: 50000000
+    neft:
+      success-rate: 0.995
+      mean-latency-ms: 100
+      timeout-rate: 0.005
+      max-amount-paise: 9223372036854775807
+
+resilience4j:
+  circuitbreaker:
+    instances:
+      upi:   { failureRateThreshold: 50, slidingWindowSize: 10, waitDurationInOpenState: 30s }
+      imps:  { failureRateThreshold: 50, slidingWindowSize: 10, waitDurationInOpenState: 30s }
+      neft:  { failureRateThreshold: 50, slidingWindowSize: 10, waitDurationInOpenState: 30s }
