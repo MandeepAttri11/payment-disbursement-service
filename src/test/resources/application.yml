@@ -1,0 +1,26 @@
+spring:
+  datasource:
+    url: jdbc:h2:mem:disburse-test;MODE=PostgreSQL;DB_CLOSE_DELAY=-1
+disburse:
+  worker:
+    enabled: false
+  retry:
+    max-attempts-per-channel: 3
+    backoff-ms: "2000, 8000, 30000"
+    jitter-percent: 25
+  channels:
+    upi:
+      success-rate: 0.91
+      mean-latency-ms: 200
+      timeout-rate: 0.02
+      max-amount-paise: 10000000
+    imps:
+      success-rate: 0.94
+      mean-latency-ms: 400
+      timeout-rate: 0.03
+      max-amount-paise: 50000000
+    neft:
+      success-rate: 0.995
+      mean-latency-ms: 100
+      timeout-rate: 0.005
+      max-amount-paise: 9223372036854775807
