@@ -7,6 +7,7 @@ import com.paytm.disburse.channel.ChannelRouter;
 import com.paytm.disburse.domain.*;
 import com.paytm.disburse.repository.AttemptRepository;
 import com.paytm.disburse.repository.DisbursementRepository;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -24,19 +25,22 @@ public class DisbursementService {
     private final ChannelRouter router;
     private final ChannelClientRegistry channels;
     private final RetryPolicy retryPolicy;
+    private final CircuitBreakerRegistry registry;
 
     public DisbursementService(DisbursementRepository disbursements,
                                AttemptRepository attempts,
                                IdempotencyService idempotency,
                                ChannelRouter router,
                                ChannelClientRegistry channels,
-                               RetryPolicy retryPolicy) {
+                               RetryPolicy retryPolicy,
+                               CircuitBreakerRegistry registry) {
         this.disbursements = disbursements;
         this.attempts = attempts;
         this.idempotency = idempotency;
         this.router = router;
         this.channels = channels;
         this.retryPolicy = retryPolicy;
+        this.registry = registry;
     }
 
     @Transactional
@@ -96,7 +100,13 @@ public class DisbursementService {
 
         ChannelRequest req = new ChannelRequest(
             attempt.id(), d.borrowerAccount(), d.borrowerIfsc(), d.borrowerUpi(), d.amountPaise());
-        ChannelResponse resp = channels.get(channel).transfer(req);
+        ChannelResponse resp;
+        try {
+            resp = registry.circuitBreaker(channel.name().toLowerCase())
+                .executeSupplier(() -> channels.get(channel).transfer(req));
+        } catch (io.github.resilience4j.circuitbreaker.CallNotPermittedException e) {
+            resp = ChannelResponse.transient_(FailureReason.CIRCUIT_OPEN, "circuit open");
+        }
 
         applyChannelResponse(d, attempt, resp);
     }
