@@ -30,11 +30,11 @@ disburse:
     poll-interval-ms: 2000
   retry:
     max-attempts-per-channel: 3
-    backoff-ms: [2000, 8000, 30000]
+    backoff-ms: "2000,8000,30000"
     jitter-percent: 25
   uncertain:
     max-polls: 5
-    poll-backoff-ms: [5000, 15000, 30000, 60000, 120000]
+    poll-backoff-ms: "5000,15000,30000,60000,120000"
   channels:
     upi:
       success-rate: 0.91
